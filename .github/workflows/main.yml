@@ -1,0 +1,120 @@
+name: PC VIRTUAL
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Definir nome aleatório do PC
+        shell: powershell
+        run: |
+          $num = Get-Random -Minimum 10 -Maximum 100
+          $hostname = "RDP$num"
+
+          Rename-Computer -NewName $hostname -Force
+
+          echo "PC_NAME=$hostname" >> $env:GITHUB_ENV
+
+          Write-Host "Nome do PC: $hostname"
+
+      - name: Configure 32GB+ Virtual Memory (Pagefile)
+        shell: powershell
+        run: |
+          $ComputerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
+          Set-CimInstance -InputObject $ComputerSystem -Property @{AutomaticManagedPagefile = $False}
+
+          $PageFile = Get-CimInstance -ClassName Win32_PageFileSetting
+          if ($PageFile) {
+              Set-CimInstance -InputObject $PageFile -Property @{InitialSize = 32768; MaximumSize = 32768}
+          } else {
+              New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name = "C:\pagefile.sys"; InitialSize = 32768; MaximumSize = 32768}
+          }
+
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = [char[]](33..38) + [char[]](64..64)
+          }
+
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 2
+
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          net user RDP "$password" /add /y
+          net localgroup Administrators RDP /add
+          net localgroup "Remote Desktop Users" RDP /add
+
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        shell: cmd
+        run: |
+          curl.exe -L -o tailscale.msi https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi
+          msiexec.exe /i tailscale.msi /quiet /norestart
+          del tailscale.msi
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TS_KEY) {
+              Write-Error "ERRO: A secret TAILSCALE_AUTH_KEY nao existe no GitHub Secrets!"
+              exit 1
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=$env:TS_KEY `
+            --hostname="$env:PC_NAME"
+
+          Start-Sleep -Seconds 10
+
+          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+          if (-not $tsIP) {
+              Write-Error "ERRO: A sua Auth Key do Tailscale expirou ou e invalida."
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          Write-Host "`n=========================================="
+          Write-Host "DADOS PARA CONECTAR NO RDP:"
+          Write-Host "Nome do PC: $env:PC_NAME"
+          Write-Host "IP / Endereco: $env:TAILSCALE_IP"
+          Write-Host "Usuario: RDP"
+          Write-Host "Senha: $env:RDP_PASS"
+          Write-Host "==========================================`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] PC Virtual Ativo e Conectado"
+              Start-Sleep -Seconds 300
+          }
